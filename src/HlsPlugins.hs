@@ -100,6 +100,10 @@ import qualified Ide.Plugin.ExplicitFixity         as ExplicitFixity
 import qualified Ide.Plugin.ExplicitFields         as ExplicitFields
 #endif
 
+#if strictness
+import qualified Ide.Plugin.Strictness             as Strictness
+#endif
+
 -- formatters
 
 #if hls_floskell
@@ -232,5 +236,8 @@ idePlugins recorder = pluginDescToIdePlugins allPlugins
 #endif
 #if explicitFields
       ++ [let pId = "explicit-fields" in ExplicitFields.descriptor (pluginRecorder pId) pId]
+#endif
+#if strictness
+      ++ [let pId = "strictness" in Strictness.descriptor (pluginRecorder pId) pId]
 #endif
 

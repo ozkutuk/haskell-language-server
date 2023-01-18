@@ -35,6 +35,7 @@ packages:
          ./plugins/hls-gadt-plugin
          ./plugins/hls-explicit-fixity-plugin
          ./plugins/hls-explicit-record-fields-plugin
+         ./plugins/hls-strictness-plugin
          ./plugins/hls-refactor-plugin
 
 -- Standard location for temporary packages needed for particular environments

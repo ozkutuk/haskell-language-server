@@ -382,7 +382,9 @@ module Development.IDE.GHC.Compat.Core (
     module GHC.Tc.Utils.Monad,
 
     module GHC.Types.Basic,
+    module GHC.Types.Demand,
     module GHC.Types.Id,
+    module GHC.Types.Id.Info,
     module GHC.Types.Name            ,
     module GHC.Types.Name.Set,
 
@@ -620,7 +622,9 @@ import           GHC.Types.Fixity             (LexicalFixity (..), Fixity (..), 
 import           GHC.Types.Meta
 #endif
 import           GHC.Types.Basic
+import           GHC.Types.Demand
 import           GHC.Types.Id
+import           GHC.Types.Id.Info
 import           GHC.Types.Name               hiding (varName)
 import           GHC.Types.Name.Cache
 import           GHC.Types.Name.Env
