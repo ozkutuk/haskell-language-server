@@ -17,6 +17,7 @@ module Ide.Plugin.RangeMap
     fromList,
     fromList',
     filterByRange,
+    filterByPosition,
   ) where
 
 import           Data.Bifunctor                           (first)
@@ -24,7 +25,8 @@ import           Data.Foldable                            (foldl')
 import           Development.IDE.Graph.Classes            (NFData)
 import           Language.LSP.Types                       (Position,
                                                            Range (Range),
-                                                           isSubrangeOf)
+                                                           isSubrangeOf,
+                                                           positionInRange)
 #ifdef USE_FINGERTREE
 import qualified HaskellWorks.Data.IntervalMap.FingerTree as IM
 #endif
@@ -64,6 +66,14 @@ filterByRange :: Range -> RangeMap a -> [a]
 filterByRange range = map snd . IM.dominators (rangeToInterval range) . unRangeMap
 #else
 filterByRange range = map snd . filter (isSubrangeOf range . fst) . unRangeMap
+#endif
+
+-- | Filter a 'RangeMap' by a given 'Position'.
+filterByPosition :: Position -> RangeMap a -> [a]
+#ifdef USE_FINGERTREE
+filterByPosition pos = map snd . IM.search pos . unRangeMap
+#else
+filterByPosition pos = map snd . filter (positionInRange pos . fst) . unRangeMap
 #endif
 
 #ifdef USE_FINGERTREE

@@ -6,11 +6,9 @@
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
 {-# LANGUAGE LambdaCase                 #-}
 {-# LANGUAGE OverloadedStrings          #-}
-{-# LANGUAGE PatternSynonyms            #-}
 {-# LANGUAGE TupleSections              #-}
 {-# LANGUAGE TypeApplications           #-}
 {-# LANGUAGE TypeFamilies               #-}
-{-# LANGUAGE TypeOperators              #-}
 {-# LANGUAGE ViewPatterns               #-}
 
 
@@ -21,17 +19,16 @@ module Ide.Plugin.Strictness
 
 import           Control.Exception                     (evaluate, try)
 import           Control.Lens                          ((^.))
-import           Control.Monad                         ((<=<))
 import           Control.Monad.IO.Class                (MonadIO, liftIO)
 import           Control.Monad.Trans.Except            (ExceptT)
+import           Data.Foldable                         (fold)
 import           Data.Generics                         (GenericQ, listify)
+import           Data.List                             (intersperse)
 import           Data.Map                              (Map)
 import qualified Data.Map                              as Map
-import           Data.Maybe                            (catMaybes, fromJust,
-                                                        mapMaybe)
+import           Data.Maybe                            (catMaybes, mapMaybe)
 import           Data.Text                             (Text)
 import qualified Data.Text                             as T
-import           Debug.Trace                           (traceM)
 import           Development.IDE                       (IdeState,
                                                         NormalizedFilePath,
                                                         Pretty (..), Range (..),
@@ -39,27 +36,20 @@ import           Development.IDE                       (IdeState,
                                                         WithPriority (..),
                                                         srcSpanToRange)
 import           Development.IDE.Core.Rules            (runAction)
-import           Development.IDE.Core.RuleTypes        (GenerateCore (..),
-                                                        GetModIface (..),
-                                                        HiFileResult (..))
+import           Development.IDE.Core.RuleTypes        (GenerateCore (..))
 import           Development.IDE.Core.Shake            (define, use)
 import qualified Development.IDE.Core.Shake            as Shake
 import           Development.IDE.GHC.Compat            (IdInfo)
-import           Development.IDE.GHC.Compat.Core       (Id, IfaceDecl (..),
-                                                        IfaceInfoItem (..),
-                                                        ModGuts (..), Name,
+import           Development.IDE.GHC.Compat.Core       (Id, ModGuts (..), Name,
                                                         StrictSig, getName,
-                                                        hs_valds, idInfo,
-                                                        mi_decls, nameSrcSpan,
+                                                        idInfo, nameSrcSpan,
                                                         strictnessInfo)
 import           Development.IDE.GHC.Compat.Outputable (Outputable (..))
 import           Development.IDE.GHC.Compat.Util       (GhcException)
 import           Development.IDE.GHC.Util              (printOutputable)
 import           Development.IDE.Graph                 (RuleResult)
-import           Development.IDE.Graph.Classes         (Hashable, NFData (rnf))
+import           Development.IDE.Graph.Classes         (Hashable, NFData)
 import           GHC.Generics                          (Generic)
-import           GHC.Iface.Load                        (pprModIface)
-import           Ide.Plugin.RangeMap                   (RangeMap)
 import qualified Ide.Plugin.RangeMap                   as RangeMap
 import           Ide.PluginUtils                       (getNormalizedFilePath,
                                                         handleMaybeM,
@@ -69,13 +59,12 @@ import           Ide.Types                             (PluginDescriptor (..),
                                                         PluginMethodHandler,
                                                         defaultPluginDescriptor,
                                                         mkPluginHandler)
-import           Language.LSP.Types                    (CodeAction (..),
-                                                        CodeActionKind (..),
-                                                        CodeActionParams (..),
-                                                        Command (..), List (..),
+import           Language.LSP.Types                    (Hover (..),
+                                                        HoverContents (..),
+                                                        HoverParams (..),
                                                         Method (..),
                                                         SMethod (..),
-                                                        type (|?) (InR))
+                                                        unmarkedUpContent)
 import qualified Language.LSP.Types.Lens               as L
 
 
@@ -89,39 +78,43 @@ instance Pretty Log where
 
 descriptor :: Recorder (WithPriority Log) -> PluginId -> PluginDescriptor IdeState
 descriptor recorder plId = (defaultPluginDescriptor plId)
-  { pluginHandlers = mkPluginHandler STextDocumentCodeAction codeActionProvider
+  { pluginHandlers = mkPluginHandler STextDocumentHover hoverProvider
   , pluginRules = collectDmdSigsRule
   }
 
-codeActionProvider :: PluginMethodHandler IdeState 'TextDocumentCodeAction
-codeActionProvider ideState pId (CodeActionParams _ _ docId range _) = pluginResponse $ do
+hoverProvider :: PluginMethodHandler IdeState 'TextDocumentHover
+hoverProvider ideState pId (HoverParams docId pos _) = pluginResponse $ do
   nfp <- getNormalizedFilePath (docId ^. L.uri)
-  -- pragma <- getFirstPragma pId ideState nfp
   CDSR result <- collectDmdSigs ideState nfp
   -- TODO(ozkutuk): should construct rangemap as part of the rule
-  let f = \(a, b) -> (,(a, b)) <$> nameToRange a
-  -- let f = \(a, b) -> (,(a, b)) <$> nameToRange a
+  let f (a, b) = (,(a, b)) <$> nameToRange a
   -- TODO(ozkutuk): unnecessary fromList-toList conversion
   let sigMap = RangeMap.fromList' $ mapMaybe f $ filter (not . nullSig . snd) $ Map.toList result
-  let actions = map mkCodeAction (RangeMap.filterByRange range sigMap)
-  pure $ List actions
+  let hover = mkHover (RangeMap.filterByPosition pos sigMap)
+  pure hover
 
   where
-    mkCodeAction :: (Name, RenderedDmdSig) -> Command |? CodeAction
-    mkCodeAction sig = InR CodeAction
-      { _title = mkCodeActionTitle sig
-      , _kind = Nothing
-      , _diagnostics = Nothing
-      , _isPreferred = Nothing
-      , _disabled = Nothing
-      , _edit = Nothing
-      , _command = Nothing
-      , _xdata = Nothing
-      }
+    mkHover :: [(Name, RenderedDmdSig)] -> Maybe Hover
+    mkHover [] = Nothing
+    -- TODO(ozkutuk): This case distinction between single vs multiple
+    -- signatures is only temporary until we decide whether we want multiple
+    -- sigs at all
+    mkHover [x] = Just $ Hover (mkSingle True x) Nothing
+    -- Separate multiple signatures with newlines
+    mkHover xs = Just $ Hover (fold . intersperse (toHoverContents "\n") . map (mkSingle False) $ xs) Nothing
 
-    mkCodeActionTitle :: (Name, RenderedDmdSig) -> Text
-    mkCodeActionTitle (nm, RenderedDmdSig sig) =
-      "NAME: " <> printOutputable nm <> "    STRICTNESS: " <> sig
+    mkSingle :: Bool -> (Name, RenderedDmdSig) -> HoverContents
+    mkSingle single p = toHoverContents $ mkSingleText p single
+
+    toHoverContents :: Text -> HoverContents
+    toHoverContents = HoverContents . unmarkedUpContent
+
+    -- Bool determines if we want to disambiguate the signature by providing
+    -- the corresponding name as well
+    mkSingleText :: (Name, RenderedDmdSig) -> Bool -> Text
+    mkSingleText (_, RenderedDmdSig sig) True = "Strictness: " <> sig
+    mkSingleText (nm, RenderedDmdSig sig) False =
+      "Strictness (" <> printOutputable nm <> "): " <> sig
 
 collectDmdSigsRule ::  Rules ()
 collectDmdSigsRule = define mempty $ \CollectDmdSigs nfp ->
