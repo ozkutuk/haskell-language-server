@@ -1,4 +1,5 @@
 {-# LANGUAGE DataKinds                  #-}
+{-# LANGUAGE DeriveAnyClass             #-}
 {-# LANGUAGE DeriveGeneric              #-}
 {-# LANGUAGE DerivingStrategies         #-}
 {-# LANGUAGE DuplicateRecordFields      #-}
@@ -34,13 +35,18 @@ import           Development.IDE                       (IdeState,
                                                         Pretty (..), Range (..),
                                                         Recorder (..), Rules,
                                                         WithPriority (..),
+                                                        cmapWithPrio,
                                                         srcSpanToRange)
 import           Development.IDE.Core.Rules            (runAction)
-import           Development.IDE.Core.RuleTypes        (GenerateCore (..))
+import           Development.IDE.Core.RuleTypes        (GenerateCore (..),
+                                                        GetModSummary (..),
+                                                        msrModSummary)
 import           Development.IDE.Core.Shake            (define, use)
 import qualified Development.IDE.Core.Shake            as Shake
 import           Development.IDE.GHC.Compat            (IdInfo)
-import           Development.IDE.GHC.Compat.Core       (Id, ModGuts (..), Name,
+import           Development.IDE.GHC.Compat.Core       (DynFlags, Id,
+                                                        ModGuts (..),
+                                                        ModSummary (..), Name,
                                                         StrictSig, getName,
                                                         idInfo, nameSrcSpan,
                                                         strictnessInfo)
@@ -49,6 +55,8 @@ import           Development.IDE.GHC.Compat.Util       (GhcException)
 import           Development.IDE.GHC.Util              (printOutputable)
 import           Development.IDE.Graph                 (RuleResult)
 import           Development.IDE.Graph.Classes         (Hashable, NFData)
+import           Development.IDE.Types.Logger          (Priority (..), logWith)
+import           GHC.Driver.Session                    (optLevel)
 import           GHC.Generics                          (Generic)
 import qualified Ide.Plugin.RangeMap                   as RangeMap
 import           Ide.PluginUtils                       (getNormalizedFilePath,
@@ -68,30 +76,40 @@ import           Language.LSP.Types                    (Hover (..),
 import qualified Language.LSP.Types.Lens               as L
 
 
-
 data Log
   = LogShake Shake.Log
+  | LogPluginDisabled
+  | LogPluginEnabled
 
 instance Pretty Log where
   pretty = \case
     LogShake shakeLog -> pretty shakeLog
+    LogPluginDisabled -> "Strictness analysis disabled"
+    LogPluginEnabled  -> "Strictness analysis enabled"
 
 descriptor :: Recorder (WithPriority Log) -> PluginId -> PluginDescriptor IdeState
 descriptor recorder plId = (defaultPluginDescriptor plId)
-  { pluginHandlers = mkPluginHandler STextDocumentHover hoverProvider
-  , pluginRules = collectDmdSigsRule
+  { pluginHandlers = mkPluginHandler STextDocumentHover (hoverProvider recorder)
+  , pluginRules = collectDmdSigsRule *> checkDmdAnalRule
   }
 
-hoverProvider :: PluginMethodHandler IdeState 'TextDocumentHover
-hoverProvider ideState pId (HoverParams docId pos _) = pluginResponse $ do
+hoverProvider :: Recorder (WithPriority Log) -> PluginMethodHandler IdeState 'TextDocumentHover
+hoverProvider recorder ideState pId (HoverParams docId pos _) = pluginResponse $ do
   nfp <- getNormalizedFilePath (docId ^. L.uri)
-  CDSR result <- collectDmdSigs ideState nfp
-  -- TODO(ozkutuk): should construct rangemap as part of the rule
-  let f (a, b) = (,(a, b)) <$> nameToRange a
-  -- TODO(ozkutuk): unnecessary fromList-toList conversion
-  let sigMap = RangeMap.fromList' $ mapMaybe f $ filter (not . nullSig . snd) $ Map.toList result
-  let hover = mkHover (RangeMap.filterByPosition pos sigMap)
-  pure hover
+  pluginEnabled <- checkDmdAnal ideState nfp
+  case pluginEnabled of
+    DmdAnalDisabled -> do
+      logWith recorder Debug LogPluginDisabled
+      pure Nothing
+    DmdAnalEnabled -> do
+      logWith recorder Debug LogPluginEnabled
+      CDSR result <- collectDmdSigs ideState nfp
+      -- TODO(ozkutuk): should construct rangemap as part of the rule
+      let f (a, b) = (,(a, b)) <$> nameToRange a
+      -- TODO(ozkutuk): unnecessary fromList-toList conversion
+      let sigMap = RangeMap.fromList' $ mapMaybe f $ filter (not . nullSig . snd) $ Map.toList result
+      let hover = mkHover (RangeMap.filterByPosition pos sigMap)
+      pure hover
 
   where
     mkHover :: [(Name, RenderedDmdSig)] -> Maybe Hover
@@ -116,7 +134,7 @@ hoverProvider ideState pId (HoverParams docId pos _) = pluginResponse $ do
     mkSingleText (nm, RenderedDmdSig sig) False =
       "Strictness (" <> printOutputable nm <> "): " <> sig
 
-collectDmdSigsRule ::  Rules ()
+collectDmdSigsRule :: Rules ()
 collectDmdSigsRule = define mempty $ \CollectDmdSigs nfp ->
    use GenerateCore nfp >>= \case
      Nothing -> pure ([], Nothing)
@@ -183,3 +201,40 @@ instance Show CollectDmdSigsResult where
 
 type instance RuleResult CollectDmdSigs = CollectDmdSigsResult
 
+data CheckDmdAnal = CheckDmdAnal
+                  deriving (Eq, Show, Generic)
+
+instance Hashable CheckDmdAnal
+instance NFData CheckDmdAnal
+
+data DmdAnalEnabled
+  = DmdAnalEnabled
+  | DmdAnalDisabled
+  deriving stock (Show, Generic)
+  deriving anyclass (NFData)
+
+type instance RuleResult CheckDmdAnal = DmdAnalEnabled
+
+-- We are taking a simplistic approach and assuming the demand
+-- analysis is not explicitly disabled if the optimization is
+-- explicitly enabled.
+dmdAnalEnabled :: DynFlags -> DmdAnalEnabled
+dmdAnalEnabled df =
+  if optLevel df >= 1
+    then DmdAnalEnabled
+    else DmdAnalDisabled
+
+checkDmdAnalRule ::  Rules ()
+checkDmdAnalRule = define mempty $ \CheckDmdAnal nfp ->
+   use GetModSummary nfp >>= \case
+     Nothing -> pure ([], Nothing)
+     Just ms -> do
+       let result = dmdAnalEnabled $ ms_hspp_opts $ msrModSummary ms
+       pure ([], Just result)
+
+checkDmdAnal :: MonadIO m => IdeState -> NormalizedFilePath -> ExceptT String m DmdAnalEnabled
+checkDmdAnal ideState =
+  handleMaybeM "Unable to check optimization level"
+    . liftIO
+    . runAction "Strictness" ideState
+    . use CheckDmdAnal
