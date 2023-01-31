@@ -1,4 +1,3 @@
-{-# OPTIONS_GHC -O #-}
 {-# LANGUAGE DataKinds             #-}
 {-# LANGUAGE DeriveGeneric         #-}
 {-# LANGUAGE DerivingStrategies    #-}

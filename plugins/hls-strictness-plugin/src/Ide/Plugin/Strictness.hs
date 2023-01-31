@@ -22,6 +22,7 @@ import           Control.Exception                     (evaluate, try)
 import           Control.Lens                          ((^.))
 import           Control.Monad.IO.Class                (MonadIO, liftIO)
 import           Control.Monad.Trans.Except            (ExceptT)
+import           Data.Bifunctor                        (second)
 import           Data.Bool                             (bool)
 import           Data.Foldable                         (fold)
 import           Data.Generics                         (GenericQ, listify)
@@ -56,6 +57,7 @@ import           Development.IDE.Graph                 (RuleResult)
 import           Development.IDE.Graph.Classes         (Hashable, NFData)
 import           Development.IDE.Types.Logger          (Priority (..), logWith)
 import           GHC.Generics                          (Generic)
+import           Ide.Plugin.RangeMap                   (RangeMap)
 import qualified Ide.Plugin.RangeMap                   as RangeMap
 import           Ide.PluginUtils                       (getNormalizedFilePath,
                                                         handleMaybeM,
@@ -94,6 +96,9 @@ descriptor recorder plId = (defaultPluginDescriptor plId)
 hoverProvider :: Recorder (WithPriority Log) -> PluginMethodHandler IdeState 'TextDocumentHover
 hoverProvider recorder ideState _ (HoverParams docId pos _) = pluginResponse $ do
   nfp <- getNormalizedFilePath (docId ^. L.uri)
+  -- We don't want to unnecessarily generate Core output if the
+  -- strictness analysis is not enabled for the file in question.
+  -- Therefore, we short-circuit the hover request in such a case.
   pluginEnabled <- checkDmdAnal ideState nfp
   case pluginEnabled of
     DmdAnalDisabled -> do
@@ -101,11 +106,7 @@ hoverProvider recorder ideState _ (HoverParams docId pos _) = pluginResponse $ d
       pure Nothing
     DmdAnalEnabled -> do
       logWith recorder Debug LogPluginEnabled
-      CDSR result <- collectDmdSigs ideState nfp
-      -- TODO(ozkutuk): should construct rangemap as part of the rule
-      let f (a, b) = (,(a, b)) <$> nameToRange a
-      -- TODO(ozkutuk): unnecessary fromList-toList conversion
-      let sigMap = RangeMap.fromList' $ mapMaybe f $ filter (not . nullSig . snd) $ Map.toList result
+      CDSR sigMap <- collectDmdSigs ideState nfp
       let hover = mkHover (RangeMap.filterByPosition pos sigMap)
       pure hover
 
@@ -139,10 +140,16 @@ collectDmdSigsRule = define mempty $ \CollectDmdSigs nfp ->
      Nothing -> pure ([], Nothing)
      Just modGuts -> do
        sigs <- liftIO $ getDmdSigs modGuts
-       let result = CDSR $ fmap renderDmdSig $ Map.fromList sigs
-       -- traceM $ T.unpack $ "DMDSIGSNEW " <> printOutputable (dmdSigs result)
-
+       let renderedSigs = map (second renderDmdSig) sigs
+       let rangeMap = RangeMap.fromList' $ mapMaybe annotateRange $ filter nonEmptySig renderedSigs
+       let result = CDSR rangeMap
        pure ([], Just result)
+  where
+    annotateRange :: (Name, a) -> Maybe (Range, (Name, a))
+    annotateRange (a, b) = (,(a, b)) <$> nameToRange a
+
+    nonEmptySig :: (a, RenderedDmdSig) -> Bool
+    nonEmptySig = not . nullSig . snd
 
 nameToRange :: Name -> Maybe Range
 nameToRange = srcSpanToRange . nameSrcSpan
@@ -191,7 +198,7 @@ instance Outputable RenderedDmdSig where
 renderDmdSig :: DmdSig -> RenderedDmdSig
 renderDmdSig = RenderedDmdSig . printOutputable
 
-newtype CollectDmdSigsResult = CDSR { dmdSigs :: Map Name RenderedDmdSig }
+newtype CollectDmdSigsResult = CDSR { dmdSigs :: RangeMap (Name, RenderedDmdSig) }
   deriving stock (Generic)
   deriving newtype (NFData)
 
