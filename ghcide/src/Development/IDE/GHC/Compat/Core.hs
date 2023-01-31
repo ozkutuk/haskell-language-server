@@ -488,6 +488,12 @@ module Development.IDE.GHC.Compat.Core (
     Extension(..),
 #endif
     UniqFM,
+#if !MIN_VERSION_ghc(9,4,0)
+    DmdSig,
+    pattern DmdSig,
+    dmdSigInfo,
+#endif
+    dmdAnalEnabled,
     ) where
 
 import qualified GHC
@@ -623,6 +629,7 @@ import           GHC.Types.Meta
 #endif
 import           GHC.Types.Basic
 import           GHC.Types.Demand
+import qualified GHC.Types.Demand as Demand
 import           GHC.Types.Id
 import           GHC.Types.Id.Info
 import           GHC.Types.Name               hiding (varName)
@@ -1184,4 +1191,25 @@ pattern NamedFieldPuns = RecordPuns
 type UniqFM = UniqFM.UniqFM
 #else
 type UniqFM k = UniqFM.UniqFM
+#endif
+
+#if !MIN_VERSION_ghc(9,4,0)
+type DmdSig = Demand.StrictSig
+
+pattern DmdSig :: DmdType -> DmdSig
+pattern DmdSig x = Demand.StrictSig x
+
+dmdSigInfo :: IdInfo -> DmdSig
+dmdSigInfo = strictnessInfo
+{-# INLINE dmdSigInfo #-}
+#else
+type DmdSig = Demand.DmdSig
+#endif
+
+dmdAnalEnabled :: DynFlags -> Bool
+dmdAnalEnabled df =
+  gopt Opt_Strictness df
+#if !MIN_VERSION_ghc(9,4,0)
+    -- https://gitlab.haskell.org/ghc/ghc/-/issues/20500
+    && optLevel df >= 1
 #endif

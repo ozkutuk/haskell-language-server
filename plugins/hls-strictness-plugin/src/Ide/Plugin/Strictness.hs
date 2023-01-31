@@ -22,6 +22,7 @@ import           Control.Exception                     (evaluate, try)
 import           Control.Lens                          ((^.))
 import           Control.Monad.IO.Class                (MonadIO, liftIO)
 import           Control.Monad.Trans.Except            (ExceptT)
+import           Data.Bool                             (bool)
 import           Data.Foldable                         (fold)
 import           Data.Generics                         (GenericQ, listify)
 import           Data.List                             (intersperse)
@@ -35,7 +36,6 @@ import           Development.IDE                       (IdeState,
                                                         Pretty (..), Range (..),
                                                         Recorder (..), Rules,
                                                         WithPriority (..),
-                                                        cmapWithPrio,
                                                         srcSpanToRange)
 import           Development.IDE.Core.Rules            (runAction)
 import           Development.IDE.Core.RuleTypes        (GenerateCore (..),
@@ -43,20 +43,18 @@ import           Development.IDE.Core.RuleTypes        (GenerateCore (..),
                                                         msrModSummary)
 import           Development.IDE.Core.Shake            (define, use)
 import qualified Development.IDE.Core.Shake            as Shake
-import           Development.IDE.GHC.Compat            (IdInfo)
-import           Development.IDE.GHC.Compat.Core       (DynFlags, Id,
-                                                        ModGuts (..),
+import           Development.IDE.GHC.Compat.Core       (DmdSig, DynFlags, Id,
+                                                        IdInfo, ModGuts (..),
                                                         ModSummary (..), Name,
-                                                        StrictSig, getName,
-                                                        idInfo, nameSrcSpan,
-                                                        strictnessInfo)
+                                                        dmdSigInfo, getName,
+                                                        idInfo, nameSrcSpan)
+import qualified Development.IDE.GHC.Compat.Core       as Compat
 import           Development.IDE.GHC.Compat.Outputable (Outputable (..))
 import           Development.IDE.GHC.Compat.Util       (GhcException)
 import           Development.IDE.GHC.Util              (printOutputable)
 import           Development.IDE.Graph                 (RuleResult)
 import           Development.IDE.Graph.Classes         (Hashable, NFData)
 import           Development.IDE.Types.Logger          (Priority (..), logWith)
-import           GHC.Driver.Session                    (optLevel)
 import           GHC.Generics                          (Generic)
 import qualified Ide.Plugin.RangeMap                   as RangeMap
 import           Ide.PluginUtils                       (getNormalizedFilePath,
@@ -94,7 +92,7 @@ descriptor recorder plId = (defaultPluginDescriptor plId)
   }
 
 hoverProvider :: Recorder (WithPriority Log) -> PluginMethodHandler IdeState 'TextDocumentHover
-hoverProvider recorder ideState pId (HoverParams docId pos _) = pluginResponse $ do
+hoverProvider recorder ideState _ (HoverParams docId pos _) = pluginResponse $ do
   nfp <- getNormalizedFilePath (docId ^. L.uri)
   pluginEnabled <- checkDmdAnal ideState nfp
   case pluginEnabled of
@@ -114,9 +112,10 @@ hoverProvider recorder ideState pId (HoverParams docId pos _) = pluginResponse $
   where
     mkHover :: [(Name, RenderedDmdSig)] -> Maybe Hover
     mkHover [] = Nothing
-    -- TODO(ozkutuk): This case distinction between single vs multiple
-    -- signatures is only temporary until we decide whether we want multiple
-    -- sigs at all
+    -- NOTE(ozkutuk): We only display the name explicitly if there are
+    -- multiple signatures for the given position. Multiple signatures occur if
+    -- there are any generated definitions in the resulting Core output (like
+    -- SPECIALISE'd versions, worker-wrapper transformations, etc.)
     mkHover [x] = Just $ Hover (mkSingle True x) Nothing
     -- Separate multiple signatures with newlines
     mkHover xs = Just $ Hover (fold . intersperse (toHoverContents "\n") . map (mkSingle False) $ xs) Nothing
@@ -148,13 +147,13 @@ collectDmdSigsRule = define mempty $ \CollectDmdSigs nfp ->
 nameToRange :: Name -> Maybe Range
 nameToRange = srcSpanToRange . nameSrcSpan
 
-getDmdSigs :: ModGuts -> IO [(Name, StrictSig)]
+getDmdSigs :: ModGuts -> IO [(Name, DmdSig)]
 getDmdSigs (mg_binds -> prg) = catMaybes <$> traverse extractSigFromId (collectIds prg)
 
-extractSigFromId :: Id -> IO (Maybe (Name, StrictSig))
+extractSigFromId :: Id -> IO (Maybe (Name, DmdSig))
 extractSigFromId id' = do
   let name = getName id'
-  mSig <- fmap strictnessInfo <$> idInfo'
+  mSig <- fmap dmdSigInfo <$> idInfo'
   pure $ (name,) <$> mSig
   where
     idInfo' :: IO (Maybe IdInfo)
@@ -189,7 +188,7 @@ nullSig (RenderedDmdSig s) = T.null s
 instance Outputable RenderedDmdSig where
   ppr (RenderedDmdSig s) = ppr (T.unpack s)
 
-renderDmdSig :: StrictSig -> RenderedDmdSig
+renderDmdSig :: DmdSig -> RenderedDmdSig
 renderDmdSig = RenderedDmdSig . printOutputable
 
 newtype CollectDmdSigsResult = CDSR { dmdSigs :: Map Name RenderedDmdSig }
@@ -215,14 +214,8 @@ data DmdAnalEnabled
 
 type instance RuleResult CheckDmdAnal = DmdAnalEnabled
 
--- We are taking a simplistic approach and assuming the demand
--- analysis is not explicitly disabled if the optimization is
--- explicitly enabled.
 dmdAnalEnabled :: DynFlags -> DmdAnalEnabled
-dmdAnalEnabled df =
-  if optLevel df >= 1
-    then DmdAnalEnabled
-    else DmdAnalDisabled
+dmdAnalEnabled = bool DmdAnalDisabled DmdAnalEnabled . Compat.dmdAnalEnabled
 
 checkDmdAnalRule ::  Rules ()
 checkDmdAnalRule = define mempty $ \CheckDmdAnal nfp ->
