@@ -13,6 +13,10 @@
 module Ide.Plugin.ExplicitFields
   ( descriptor
   , Log
+  , collectNamesRule
+  , CollectNames(..)
+  , CollectNamesResult(..)
+  , NameMap(..)
   ) where
 
 import           Control.Lens                    ((^.))
@@ -41,8 +45,8 @@ import           Development.IDE.GHC.Compat.Core (Extension (NamedFieldPuns),
                                                   GhcPass,
                                                   HsExpr (RecordCon, rcon_flds),
                                                   HsRecField, LHsExpr, LocatedA,
-                                                  Name, Pass (..), Pat (..),
-                                                  RealSrcSpan, UniqFM,
+                                                  LocatedN, Name, Pass (..),
+                                                  Pat (..), RealSrcSpan, UniqFM,
                                                   conPatDetails, emptyUFM,
                                                   hfbPun, hfbRHS, hs_valds,
                                                   lookupUFM, mapConPatDetail,
@@ -221,7 +225,7 @@ instance NFData GhcExtension where
 
 -- As with `GhcExtension`, this newtype exists mostly to attach
 -- an `NFData` instance to `UniqFM`.
-newtype NameMap = NameMap (UniqFM Name [Name])
+newtype NameMap = NameMap (UniqFM Name [LocatedN Name])
 
 instance NFData NameMap where
   rnf (NameMap (ufmToIntMap -> m)) = rnf m
@@ -257,7 +261,7 @@ renderRecordInfo _ (RecordInfoCon ss expr) = RenderedRecordInfo ss <$> showRecor
 referencedIn :: Name -> NameMap -> Bool
 referencedIn name (NameMap names) = maybe True hasNonBindingOcc $ lookupUFM names name
   where
-    hasNonBindingOcc :: [Name] -> Bool
+    hasNonBindingOcc :: [LocatedN Name] -> Bool
     hasNonBindingOcc = (> 1) . length
 
 -- Default to leaving the element in if somehow a name can't be extracted (i.e.
@@ -343,8 +347,8 @@ collectRecords = everything (<>) (maybeToList . (Nothing `mkQ` getRecPatterns `e
 -- 'Unique' (since 'Unique' doesn't have an 'Ord' instance, it can't be used
 -- as 'Map' key as is). More information regarding 'UniqFM' can be found in
 -- the GHC source.
-collectNames :: GenericQ (UniqFM Name [Name])
-collectNames = everything (plusUFM_C (<>)) (emptyUFM `mkQ` (\x -> unitUFM x [x]))
+collectNames :: GenericQ (UniqFM Name [LocatedN Name])
+collectNames = everything (plusUFM_C (<>)) (emptyUFM `mkQ` (\x -> unitUFM (unLoc x) [x]))
 
 getRecCons :: LHsExpr (GhcPass 'Renamed) -> Maybe RecordInfo
 getRecCons e@(unLoc -> RecordCon _ _ flds)

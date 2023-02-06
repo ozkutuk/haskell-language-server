@@ -27,9 +27,8 @@ import           Data.Bool                             (bool)
 import           Data.Foldable                         (fold)
 import           Data.Generics                         (GenericQ, listify)
 import           Data.List                             (intersperse)
-import           Data.Map                              (Map)
-import qualified Data.Map                              as Map
 import           Data.Maybe                            (catMaybes, mapMaybe)
+import qualified Data.Set                              as Set
 import           Data.Text                             (Text)
 import qualified Data.Text                             as T
 import           Development.IDE                       (IdeState,
@@ -44,11 +43,14 @@ import           Development.IDE.Core.RuleTypes        (GenerateCore (..),
                                                         msrModSummary)
 import           Development.IDE.Core.Shake            (define, use)
 import qualified Development.IDE.Core.Shake            as Shake
-import           Development.IDE.GHC.Compat.Core       (DmdSig, DynFlags, Id,
+import           Development.IDE.GHC.Compat            (LocatedN)
+import           Development.IDE.GHC.Compat.Core       (DmdSig, DynFlags,
+                                                        GenLocated (..), Id,
                                                         IdInfo, ModGuts (..),
                                                         ModSummary (..), Name,
                                                         dmdSigInfo, getName,
-                                                        idInfo, nameSrcSpan)
+                                                        idInfo, lookupUFM,
+                                                        nameSrcSpan)
 import qualified Development.IDE.GHC.Compat.Core       as Compat
 import           Development.IDE.GHC.Compat.Outputable (Outputable (..))
 import           Development.IDE.GHC.Compat.Util       (GhcException)
@@ -57,6 +59,10 @@ import           Development.IDE.Graph                 (RuleResult)
 import           Development.IDE.Graph.Classes         (Hashable, NFData)
 import           Development.IDE.Types.Logger          (Priority (..), logWith)
 import           GHC.Generics                          (Generic)
+import           Ide.Plugin.ExplicitFields             (CollectNames (..),
+                                                        CollectNamesResult (..),
+                                                        NameMap (..),
+                                                        collectNamesRule)
 import           Ide.Plugin.RangeMap                   (RangeMap)
 import qualified Ide.Plugin.RangeMap                   as RangeMap
 import           Ide.PluginUtils                       (getNormalizedFilePath,
@@ -90,7 +96,7 @@ instance Pretty Log where
 descriptor :: Recorder (WithPriority Log) -> PluginId -> PluginDescriptor IdeState
 descriptor recorder plId = (defaultPluginDescriptor plId)
   { pluginHandlers = mkPluginHandler STextDocumentHover (hoverProvider recorder)
-  , pluginRules = collectDmdSigsRule *> checkDmdAnalRule
+  , pluginRules = collectDmdSigsRule *> checkDmdAnalRule *> collectNamesRule
   }
 
 hoverProvider :: Recorder (WithPriority Log) -> PluginMethodHandler IdeState 'TextDocumentHover
@@ -141,18 +147,38 @@ collectDmdSigsRule = define mempty $ \CollectDmdSigs nfp ->
      Just modGuts -> do
        sigs <- liftIO $ getDmdSigs modGuts
        let renderedSigs = map (second renderDmdSig) sigs
-       let rangeMap = RangeMap.fromList' $ mapMaybe annotateRange $ filter nonEmptySig renderedSigs
-       let result = CDSR rangeMap
-       pure ([], Just result)
-  where
-    annotateRange :: (Name, a) -> Maybe (Range, (Name, a))
-    annotateRange (a, b) = (,(a, b)) <$> nameToRange a
+       names <- use CollectNames nfp
 
+       let
+         attachSigsToRefs :: [(Name, RenderedDmdSig)] -> [(Range, (Name, RenderedDmdSig))]
+         attachSigsToRefs = case names of
+           Nothing -> mapMaybe annotateRange
+           Just (CNR (NameMap names')) -> \ps ->
+             concatMap (\(nm,sig) -> mapMaybe (flip (curry annotateRange') sig) $ concat (lookupUFM names' nm)) ps
+
+       let rangeMap =
+             CDSR $
+             RangeMap.fromList' $
+             removeDuplicates $
+             attachSigsToRefs $
+             filter nonEmptySig renderedSigs
+
+       pure ([], Just rangeMap)
+  where
     nonEmptySig :: (a, RenderedDmdSig) -> Bool
     nonEmptySig = not . nullSig . snd
 
+    removeDuplicates :: Ord a => [a] -> [a]
+    removeDuplicates = Set.toList . Set.fromList
+
 nameToRange :: Name -> Maybe Range
 nameToRange = srcSpanToRange . nameSrcSpan
+
+annotateRange :: (Name, a) -> Maybe (Range, (Name, a))
+annotateRange (a, b) = (,(a, b)) <$> nameToRange a
+
+annotateRange' :: (LocatedN Name, a) -> Maybe (Range, (Name, a))
+annotateRange' (L l nm, a) = (,(nm, a)) <$> srcSpanToRange l
 
 getDmdSigs :: ModGuts -> IO [(Name, DmdSig)]
 getDmdSigs (mg_binds -> prg) = catMaybes <$> traverse extractSigFromId (collectIds prg)
@@ -187,7 +213,7 @@ instance Hashable CollectDmdSigs
 instance NFData CollectDmdSigs
 
 newtype RenderedDmdSig = RenderedDmdSig Text
-  deriving newtype (Show, NFData)
+  deriving newtype (Show, Eq, Ord, NFData)
 
 nullSig :: RenderedDmdSig -> Bool
 nullSig (RenderedDmdSig s) = T.null s
