@@ -15,7 +15,7 @@
 
 module Ide.Plugin.Strictness
   ( descriptor
-  -- , Log
+  , Log
   ) where
 
 import           Control.Exception                     (evaluate, try)
@@ -49,7 +49,7 @@ import           Development.IDE.GHC.Compat.Core       (DmdSig, DynFlags,
                                                         IdInfo, ModGuts (..),
                                                         ModSummary (..), Name,
                                                         dmdSigInfo, getName,
-                                                        idInfo, lookupUFM,
+                                                        idInfo, locA, lookupUFM,
                                                         nameSrcSpan)
 import qualified Development.IDE.GHC.Compat.Core       as Compat
 import           Development.IDE.GHC.Compat.Outputable (Outputable (..))
@@ -178,7 +178,7 @@ annotateRange :: (Name, a) -> Maybe (Range, (Name, a))
 annotateRange (a, b) = (,(a, b)) <$> nameToRange a
 
 annotateRange' :: (LocatedN Name, a) -> Maybe (Range, (Name, a))
-annotateRange' (L l nm, a) = (,(nm, a)) <$> srcSpanToRange l
+annotateRange' (L l nm, a) = (,(nm, a)) <$> srcSpanToRange (locA l)
 
 getDmdSigs :: ModGuts -> IO [(Name, DmdSig)]
 getDmdSigs (mg_binds -> prg) = catMaybes <$> traverse extractSigFromId (collectIds prg)
